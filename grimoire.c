@@ -16,6 +16,9 @@
 #include "hours.h"
 #include "sigil.h"
 #include "talisman.h"
+#include "wand.h"
+#include <toolbox/level_duration.h>
+#include <lib/subghz/devices/cc1101_configs.h>
 
 #define TICK_MS 50
 #define W       128
@@ -71,6 +74,21 @@ typedef enum {
 #define ASH_MAX  120
 #define WISH_MAX 48
 #define NAME_MAX 24
+
+typedef enum {
+    WandIdle, // listening
+    WandWaiting, // a blessing is out; an answer may come
+    WandAnswered,
+    WandNoAnswer,
+    WandReceived, // someone else's blessing came in; we answer it
+    WandRefused, // the region forbids sending here
+} WandState;
+
+static const uint32_t wand_freqs[] = {433920000, 315000000, 868350000, 915000000};
+#define WAND_FREQS COUNT_OF(wand_freqs)
+#define WAND_RING  256
+#define WAND_TIP_X 117
+#define WAND_TIP_Y 17
 
 #define TAL_X0   86
 #define TAL_Y0   13
@@ -131,6 +149,23 @@ typedef struct {
     char tal_name[NAME_MAX];
     uint16_t tal_values[NAME_MAX];
     size_t tal_n;
+
+    // wand
+    uint8_t wand_freq;
+    WandState wand_state;
+    uint16_t wand_left;
+    WandMessage wand_last;
+    bool wand_have_last;
+    bool wand_listening;
+    bool wand_answer_due;
+    uint32_t wand_rx_tick;
+    WandPulse wand_pulses[WAND_PULSES];
+    size_t wand_pulse_n;
+    volatile size_t wand_pulse_i;
+    volatile uint32_t wand_ring[WAND_RING]; // level in the top bit, microseconds below
+    volatile uint16_t wand_head;
+    uint16_t wand_tail;
+    WandDecoder wand_dec;
 
     // text entry
     bool text_done;
@@ -492,6 +527,160 @@ static void talisman_choose(App* app, int dir) {
     if(!talisman_layer_ok(app, app->tal_layer)) talisman_next_layer(app);
 }
 
+// ---------------------------------------------------------------- wand
+
+// In interrupt context: just keep the pulse
+static void wand_rx_isr(bool level, uint32_t duration, void* context) {
+    App* app = context;
+    uint16_t h = app->wand_head;
+    app->wand_ring[h] = (duration & 0x7FFFFFFFu) | (level ? 0x80000000u : 0u);
+    app->wand_head = (h + 1) % WAND_RING;
+}
+
+// In interrupt context: the next pulse to send
+static LevelDuration wand_tx_yield(void* context) {
+    App* app = context;
+    if(app->wand_pulse_i >= app->wand_pulse_n) return level_duration_reset();
+    const WandPulse* p = &app->wand_pulses[app->wand_pulse_i++];
+    return level_duration_make(p->level, p->duration);
+}
+
+static void wand_listen_start(App* app) {
+    furi_hal_subghz_idle();
+    furi_hal_subghz_set_frequency_and_path(wand_freqs[app->wand_freq]);
+    app->wand_head = 0;
+    app->wand_tail = 0;
+    wand_decoder_reset(&app->wand_dec);
+    furi_hal_subghz_start_async_rx(wand_rx_isr, app);
+    app->wand_listening = true;
+}
+
+static void wand_listen_stop(App* app) {
+    if(app->wand_listening) {
+        furi_hal_subghz_stop_async_rx();
+        app->wand_listening = false;
+    }
+    furi_hal_subghz_idle();
+}
+
+static void wand_start(App* app) {
+    furi_hal_subghz_reset();
+    furi_hal_subghz_idle();
+    furi_hal_subghz_load_custom_preset(subghz_device_cc1101_preset_ook_650khz_async_regs);
+    app->wand_state = WandIdle;
+    app->wand_left = 0;
+    app->wand_answer_due = false;
+    wand_listen_start(app);
+}
+
+static void wand_stop(App* app) {
+    wand_listen_stop(app);
+    furi_hal_subghz_sleep();
+    sound_quiet(app);
+}
+
+// Sends the hour, blocking for about a third of a second. False where the region forbids it.
+static bool wand_send(App* app, bool answer) {
+    WandMessage m = {
+        .answer = answer,
+        .planet = app->hour_known ? app->hour.planet : PlanetSun,
+        .is_day = app->hour_known ? app->hour.is_day : true,
+        .index = app->hour_known ? app->hour.index : 1,
+        .minute = app->now.minute,
+    };
+    app->wand_pulse_n = wand_encode(&m, app->wand_pulses);
+    app->wand_pulse_i = 0;
+    wand_listen_stop(app);
+    furi_hal_subghz_set_frequency_and_path(wand_freqs[app->wand_freq]);
+    bool ok = furi_hal_subghz_start_async_tx(wand_tx_yield, app);
+    if(ok) {
+        // a sweep up for a blessing, down for an answer, while the frames go out
+        for(int i = 0; i < 80 && !furi_hal_subghz_is_async_tx_complete(); i++) {
+            sound_tone(app, answer ? 1500.0f - i * 12.0f : 400.0f + i * 14.0f, 0.3f);
+            furi_delay_ms(10);
+        }
+        furi_hal_subghz_stop_async_tx();
+    }
+    sound_quiet(app);
+    furi_hal_subghz_idle();
+    wand_listen_start(app);
+    return ok;
+}
+
+static void wand_cast(App* app) {
+    if(app->wand_state == WandWaiting || app->wand_state == WandReceived) return;
+    if(wand_send(app, false)) {
+        app->wand_state = WandWaiting;
+        app->wand_left = 100; // five seconds for an answer
+    } else {
+        app->wand_state = WandRefused;
+        app->wand_left = 60;
+    }
+}
+
+static void wand_tune(App* app, int dir) {
+    uint8_t f = app->wand_freq;
+    for(size_t i = 0; i < WAND_FREQS; i++) {
+        f = (f + WAND_FREQS + dir) % WAND_FREQS;
+        if(furi_hal_subghz_is_frequency_valid(wand_freqs[f])) break;
+    }
+    if(f == app->wand_freq) return;
+    app->wand_freq = f;
+    wand_listen_stop(app);
+    wand_listen_start(app);
+    app->wand_state = WandIdle;
+    app->wand_left = 0;
+}
+
+static void wand_step(App* app) {
+    uint32_t now = furi_get_tick();
+    while(app->wand_tail != app->wand_head) {
+        uint32_t v = app->wand_ring[app->wand_tail];
+        app->wand_tail = (app->wand_tail + 1) % WAND_RING;
+        WandMessage m;
+        if(!wand_decoder_feed(&app->wand_dec, v >> 31, v & 0x7FFFFFFFu, &m)) continue;
+        if((int32_t)(now - app->wand_rx_tick) < 1000) continue; // the same burst, repeated
+        app->wand_rx_tick = now;
+        app->wand_last = m;
+        app->wand_have_last = true;
+        app->flash = 2;
+        notification_message(app->notifications, &sequence_single_vibro);
+        if(m.answer) {
+            if(app->wand_state == WandWaiting) {
+                app->wand_state = WandAnswered;
+                app->wand_left = 80;
+            }
+        } else {
+            app->wand_state = WandReceived;
+            app->wand_left = 30;
+            app->wand_answer_due = true;
+        }
+        break;
+    }
+    if(app->wand_answer_due && app->wand_state == WandReceived && app->wand_left <= 20) {
+        app->wand_answer_due = false;
+        wand_send(app, true);
+    }
+    if(app->wand_left && --app->wand_left == 0) {
+        if(app->wand_state == WandWaiting) {
+            app->wand_state = WandNoAnswer;
+            app->wand_left = 60;
+        } else {
+            app->wand_state = WandIdle;
+        }
+    }
+    // a soft tick while an answer is awaited, a chime when one comes
+    if(app->wand_state == WandWaiting && app->wand_left % 20 == 0) {
+        sound_click(app, 1800.0f);
+    } else if(app->wand_state == WandAnswered && app->wand_left > 72) {
+        sound_tone(app, 660.0f + (80 - app->wand_left) * 60.0f, 0.3f);
+    } else if(app->wand_state == WandReceived && app->wand_left > 24) {
+        sound_tone(app, 520.0f + (30 - app->wand_left) * 50.0f, 0.3f);
+    } else {
+        sound_quiet(app);
+    }
+}
+
 // ---------------------------------------------------------------- drawing
 
 static void draw_tabs(Canvas* canvas, App* app) {
@@ -805,6 +994,88 @@ static void draw_talisman(Canvas* canvas, App* app) {
     canvas_draw_str_aligned(canvas, TAL_X0 - 4, 51, AlignRight, AlignBottom, kind);
 }
 
+static void draw_wand(Canvas* canvas, App* app) {
+    // the staff, from the lower left up to the tip, and a star at the tip
+    canvas_draw_line(canvas, 86, 52, WAND_TIP_X - 2, WAND_TIP_Y + 2);
+    canvas_draw_line(canvas, 87, 52, WAND_TIP_X - 1, WAND_TIP_Y + 2);
+    canvas_draw_line(canvas, 86, 51, WAND_TIP_X - 2, WAND_TIP_Y + 1);
+    canvas_draw_line(canvas, WAND_TIP_X - 3, WAND_TIP_Y, WAND_TIP_X + 3, WAND_TIP_Y);
+    canvas_draw_line(canvas, WAND_TIP_X, WAND_TIP_Y - 3, WAND_TIP_X, WAND_TIP_Y + 3);
+    canvas_draw_line(canvas, WAND_TIP_X - 2, WAND_TIP_Y - 2, WAND_TIP_X + 2, WAND_TIP_Y + 2);
+    canvas_draw_line(canvas, WAND_TIP_X + 2, WAND_TIP_Y - 2, WAND_TIP_X - 2, WAND_TIP_Y + 2);
+    bool busy = app->wand_state == WandWaiting || app->wand_state == WandReceived ||
+                app->wand_state == WandAnswered;
+    if(busy) {
+        // rings going out from the tip
+        for(int k = 0; k < 3; k++) {
+            int r = (app->frame * 2 + k * 8) % 26 + 4;
+            for(int a = 90; a <= 270; a += 6) {
+                float rad = a * 0.0174533f;
+                int x = WAND_TIP_X + (int)(cosf(rad) * r), y = WAND_TIP_Y - (int)(sinf(rad) * r);
+                if(x > 72 && y > 12 && y < 53) canvas_draw_dot(canvas, x, y);
+            }
+        }
+    } else if(app->wand_state == WandIdle && (app->frame / 10) % 2) {
+        canvas_draw_dot(canvas, WAND_TIP_X - 5, WAND_TIP_Y - 5);
+    }
+
+    canvas_set_font(canvas, FontSecondary);
+    char buf[32];
+    char who[24] = "";
+    if(app->wand_have_last) {
+        snprintf(
+            who,
+            sizeof(who),
+            "%s %s %u",
+            planet_names[app->wand_last.planet],
+            app->wand_last.is_day ? "day" : "night",
+            app->wand_last.index);
+    }
+    switch(app->wand_state) {
+    case WandWaiting:
+        canvas_draw_str(canvas, 2, 24, "blessing cast");
+        snprintf(buf, sizeof(buf), "an answer? %us", (app->wand_left + 19) / 20);
+        canvas_draw_str(canvas, 2, 36, buf);
+        break;
+    case WandAnswered:
+        canvas_set_font(canvas, FontPrimary);
+        canvas_draw_rbox(canvas, 2, 20, 70, 16, 3);
+        canvas_set_color(canvas, ColorWhite);
+        canvas_draw_str_aligned(canvas, 37, 28, AlignCenter, AlignCenter, "ANSWERED");
+        canvas_set_color(canvas, ColorBlack);
+        canvas_set_font(canvas, FontSecondary);
+        canvas_draw_str(canvas, 2, 48, who);
+        break;
+    case WandNoAnswer:
+        canvas_draw_str(canvas, 2, 24, "no answer came");
+        canvas_draw_str(canvas, 2, 36, "the air is quiet");
+        break;
+    case WandReceived:
+        canvas_draw_str(canvas, 2, 24, "a blessing came");
+        canvas_draw_str(canvas, 2, 36, who);
+        canvas_draw_str(canvas, 2, 48, "answering it");
+        break;
+    case WandRefused:
+        canvas_draw_str(canvas, 2, 24, "the region forbids");
+        canvas_draw_str(canvas, 2, 36, "sending here");
+        break;
+    default:
+        snprintf(
+            buf,
+            sizeof(buf),
+            "listening %lu.%02lu",
+            wand_freqs[app->wand_freq] / 1000000,
+            (wand_freqs[app->wand_freq] / 10000) % 100);
+        canvas_draw_str(canvas, 2, 24, buf);
+        if(app->wand_have_last) {
+            canvas_draw_str(canvas, 2, 36, "last:");
+            canvas_draw_str(canvas, 26, 36, who);
+        }
+        canvas_draw_str(canvas, 2, 48, "OK: cast a blessing");
+        break;
+    }
+}
+
 static void draw_stub(Canvas* canvas) {
     canvas_set_font(canvas, FontSecondary);
     canvas_draw_str_aligned(canvas, 64, 32, AlignCenter, AlignCenter, "in the making");
@@ -873,6 +1144,9 @@ static void draw_callback(Canvas* canvas, void* context) {
         case PageTalisman:
             draw_talisman(canvas, app);
             break;
+        case PageWand:
+            draw_wand(canvas, app);
+            break;
         default:
             draw_stub(canvas);
             break;
@@ -917,9 +1191,11 @@ static void handle_input(App* app, const InputEvent* event) {
     case InputKeyLeft:
     case InputKeyRight:
         furi_mutex_acquire(app->mutex, FuriWaitForever);
+        if(app->page == PageWand) wand_stop(app);
         app->page =
             (Page)((app->page + PageCount + (event->key == InputKeyRight ? 1 : -1)) % PageCount);
         if(app->page == PageHours) app->table_night = app->hour_known && !app->hour.is_day;
+        if(app->page == PageWand) wand_start(app);
         sound_quiet(app);
         furi_mutex_release(app->mutex);
         return;
@@ -953,6 +1229,15 @@ static void handle_input(App* app, const InputEvent* event) {
             furi_mutex_release(app->mutex);
         }
         break;
+    case PageWand:
+        furi_mutex_acquire(app->mutex, FuriWaitForever);
+        if(event->key == InputKeyOk) {
+            wand_cast(app);
+        } else if(event->key == InputKeyUp || event->key == InputKeyDown) {
+            wand_tune(app, event->key == InputKeyUp ? 1 : -1);
+        }
+        furi_mutex_release(app->mutex);
+        break;
     default:
         break;
     }
@@ -969,6 +1254,9 @@ static void tick(App* app) {
         break;
     case PageSigil:
         sigil_step(app);
+        break;
+    case PageWand:
+        wand_step(app);
         break;
     default:
         break;
@@ -1016,6 +1304,7 @@ int32_t grimoire_app(void* p) {
         tick(app);
     }
 
+    if(app->page == PageWand) wand_stop(app);
     sound_release(app);
     notification_message(app->notifications, &sequence_reset_rgb);
     furi_record_close(RECORD_NOTIFICATION);

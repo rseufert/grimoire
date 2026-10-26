@@ -3,7 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-static const HoursPlace portland = {45.5152f, -122.6784f, -8 * 60, true};
+static const HoursPlace portland = {45.52f, -122.68f, -8 * 60, true};
 static int fails = 0;
 
 static void expect_sun(int y, int m, int d, int rise, int set) {

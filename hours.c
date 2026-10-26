@@ -74,7 +74,7 @@ bool hours_sun(
     int16_t* sunset) {
     // NOAA's solar calculator, at local noon
     float days = leap(y) ? 366.0f : 365.0f;
-    float g = 2.0f * (float)M_PI / days * (day_of_year(y, m, d) - 1);
+    float g = 2.0f * (float)M_PI / days * (day_of_year(y, m, d) - 1 + 0.5f);
     float eqtime = 229.18f * (0.000075f + 0.001868f * cosf(g) - 0.032077f * sinf(g) -
                               0.014615f * cosf(2 * g) - 0.040849f * sinf(2 * g));
     float decl = 0.006918f - 0.399912f * cosf(g) + 0.070257f * sinf(g) - 0.006758f * cosf(2 * g) +
